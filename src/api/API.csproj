@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <WarningsAsErrors>nullable</WarningsAsErrors>
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <RootNamespace>GotoRef.Api</RootNamespace>
+    <AssemblyName>GotoRef.API</AssemblyName>
+    <UserSecretsId>601743fa-814c-44ce-9669-09fb08717fd7</UserSecretsId>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <Version>1.0.0.0</Version>
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <FileVersion>1.0.0.0</FileVersion>
+    <Company>Nulldev</Company>
+    <Authors>AugustoDeveloper</Authors>
+    <Product>GotoRef API</Product>
+    <Description>Application responsible for insepect nuget packages</Description>
+    <Copyright>Copyright © $([System.DateTime]::UtcNow.Year.ToString())</Copyright>
+  </PropertyGroup>
+
+  <ItemGroup>
+   <PackageReference Include="NuGet.Protocol" Version="6.9.1" />
+  </ItemGroup>
+
+</Project>
