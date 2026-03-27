@@ -11,7 +11,7 @@ jobs:
   version:
     runs-on: ubuntu-latest
     outputs:
-      new_version: ${{ steps.bump.outputs.new_version }}
+      new_version: ${{ steps.bump.outputs.next }}
       skipped: ${{ steps.bump.outputs.skipped }}
     steps:
       - uses: actions/checkout@v4
@@ -27,17 +27,21 @@ jobs:
           patchList: "fix, perf, refactor, build, chore, docs, style, test, ci"
           noVersionBumpBehavior: skip
 
-      - name: Create tag
+      - name: Create tag and push
         if: steps.bump.outputs.skipped != 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
-          git tag ${{ steps.bump.outputs.new_version }}
-          git push origin ${{ steps.bump.outputs.new_version }}
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag ${{ steps.bump.outputs.next }}
+          git push origin ${{ steps.bump.outputs.next }}
 
       - name: Create GitHub Release
         if: steps.bump.outputs.skipped != 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.bump.outputs.new_version }}
+          tag_name: ${{ steps.bump.outputs.next }}
           generate_release_notes: true
 
   deploy:
