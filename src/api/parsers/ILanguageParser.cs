@@ -10,5 +10,5 @@ namespace GotoRef.Api.Parsers;
 public interface ILanguageParser
 {
     string Language { get; }
-    Task<List<NamespaceDetail>> ExtractTypesAsync(string packagePath, CancellationToken ct = default);
+    Task<List<NamespaceDetail>> ExtractTypesAsync(string packagePath, string packageId, CancellationToken ct = default);
 }

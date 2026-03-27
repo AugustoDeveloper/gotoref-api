@@ -16,7 +16,7 @@ public class ReflectionParser : ILanguageParser
 
     public ReflectionParser(ILogger<ReflectionParser> logger) => _logger = logger;
 
-    public async Task<List<NamespaceDetail>> ExtractTypesAsync(string nupkgPath, CancellationToken ct = default)
+    public async Task<List<NamespaceDetail>> ExtractTypesAsync(string nupkgPath, string packageId, CancellationToken ct = default)
     {
         var extractDir = Path.Combine(Path.GetTempPath(), "gotoref-extracted", Path.GetFileNameWithoutExtension(nupkgPath));
         Directory.CreateDirectory(extractDir);
@@ -26,13 +26,14 @@ public class ReflectionParser : ILanguageParser
         var dlls = FindBestDlls(extractDir);
         if (dlls.Count == 0) { _logger.LogWarning("No DLLs found in {Path}", nupkgPath); return []; }
 
+        var assemblyMap = AssemblyPackageMap.Build(nupkgPath, dlls);
         var xmlDocs = LoadXmlDocs(extractDir);
         var namespaces = new Dictionary<string, List<TypeDetail>>(StringComparer.Ordinal);
         var overloadCounts = new Dictionary<string, int>(StringComparer.Ordinal);
 
         foreach (var dll in dlls)
         {
-            try { ExtractFromDll(dll, xmlDocs, namespaces, overloadCounts); }
+            try { ExtractFromDll(dll, xmlDocs, namespaces, overloadCounts, assemblyMap); }
             catch (Exception ex) { _logger.LogWarning(ex, "Failed to read {Dll}", dll); }
         }
 
@@ -158,13 +159,15 @@ public class ReflectionParser : ILanguageParser
         string dllPath,
         Dictionary<string, XmlDocMember> xmlDocs,
         Dictionary<string, List<TypeDetail>> namespaces,
-        Dictionary<string, int> overloadCounts)
+        Dictionary<string, int> overloadCounts,
+        AssemblyPackageMap assemblyMap)
     {
         using var stream = File.OpenRead(dllPath);
         using var peReader = new PEReader(stream);
         if (!peReader.HasMetadata) return;
 
         var reader = peReader.GetMetadataReader();
+        var richDecoder = new RichTypeDecoder(reader, assemblyMap);
 
         foreach (var typeHandle in reader.TypeDefinitions)
         {
@@ -184,10 +187,13 @@ public class ReflectionParser : ILanguageParser
             var isSealed = typeDef.Attributes.HasFlag(TypeAttributes.Sealed) && !typeDef.Attributes.HasFlag(TypeAttributes.Abstract);
             var isAbstract = typeDef.Attributes.HasFlag(TypeAttributes.Abstract) && !typeDef.Attributes.HasFlag(TypeAttributes.Sealed);
 
-            var properties = ExtractProperties(reader, typeDef, fullName, xmlDocs);
-            var (methods, ctors) = ExtractMethods(reader, typeDef, fullName, xmlDocs, overloadCounts);
-            var (fields, enumValues) = ExtractFields(reader, typeDef, fullName, xmlDocs, kind);
-            var events = ExtractEvents(reader, typeDef, fullName, xmlDocs);
+            var properties = ExtractProperties(reader, typeDef, fullName, xmlDocs, richDecoder);
+            var (methods, ctors) = ExtractMethods(reader, typeDef, fullName, xmlDocs, overloadCounts, richDecoder);
+            var (fields, enumValues) = ExtractFields(reader, typeDef, fullName, xmlDocs, kind, richDecoder);
+            var events = ExtractEvents(reader, typeDef, fullName, xmlDocs, richDecoder);
+
+            var baseTypeRef = GetBaseTypeRef(reader, typeDef, richDecoder);
+            var interfacesRef = GetInterfaceRefs(reader, typeDef, richDecoder);
 
             if (!namespaces.ContainsKey(namespaceName)) namespaces[namespaceName] = [];
 
@@ -207,7 +213,9 @@ public class ReflectionParser : ILanguageParser
                 Constructors: ctors,
                 Fields: fields,
                 EnumValues: enumValues,
-                Events: events
+                Events: events,
+                BaseTypeRef: baseTypeRef,
+                InterfacesRef: interfacesRef
             ));
         }
     }
@@ -227,7 +235,7 @@ public class ReflectionParser : ILanguageParser
 
     private static List<PropertyDetail> ExtractProperties(
         MetadataReader reader, TypeDefinition typeDef, string fullName,
-        Dictionary<string, XmlDocMember> xmlDocs)
+        Dictionary<string, XmlDocMember> xmlDocs, RichTypeDecoder richDecoder)
     {
         var result = new List<PropertyDetail>();
         foreach (var handle in typeDef.GetProperties())
@@ -244,14 +252,17 @@ public class ReflectionParser : ILanguageParser
             var hasGetter = !accessors.Getter.IsNil;
             var hasSetter = !accessors.Setter.IsNil;
 
+            var (typeName, typeRef) = DecodePropertyType(reader, prop, richDecoder);
+
             result.Add(new PropertyDetail(
                 Name: name,
-                TypeName: DecodePropertyType(reader, prop),
+                TypeName: typeName,
                 HasGetter: hasGetter,
                 HasSetter: hasSetter,
                 Accessors: hasGetter && hasSetter ? "get; set;" : hasGetter ? "get;" : "set;",
                 IsStatic: getter.Attributes.HasFlag(MethodAttributes.Static),
-                Summary: xml?.Summary
+                Summary: xml?.Summary,
+                TypeNameRef: typeRef
             ));
         }
         return result;
@@ -259,7 +270,8 @@ public class ReflectionParser : ILanguageParser
 
     private static (List<MethodDetail> Methods, List<MethodDetail> Constructors) ExtractMethods(
         MetadataReader reader, TypeDefinition typeDef, string fullName,
-        Dictionary<string, XmlDocMember> xmlDocs, Dictionary<string, int> overloadCounts)
+        Dictionary<string, XmlDocMember> xmlDocs, Dictionary<string, int> overloadCounts,
+        RichTypeDecoder richDecoder)
     {
         var methods = new List<MethodDetail>();
         var ctors = new List<MethodDetail>();
@@ -288,7 +300,7 @@ public class ReflectionParser : ILanguageParser
             var isVirtual = method.Attributes.HasFlag(MethodAttributes.Virtual) && !isAbstract;
             var isOverride = isVirtual && !method.Attributes.HasFlag(MethodAttributes.NewSlot);
             var genericParams = GetGenericParams(reader, method.GetGenericParameters());
-            var (returnType, parameters) = DecodeMethodSignature(reader, method, xml);
+            var (returnType, parameters, returnTypeRef, paramRefs) = DecodeMethodSignature(reader, method, xml, richDecoder);
 
             var modParts = new List<string> { "public" };
             if (isStatic) modParts.Add("static");
@@ -298,7 +310,9 @@ public class ReflectionParser : ILanguageParser
 
             var genericStr = genericParams.Length > 0 ? $"<{string.Join(", ", genericParams)}>" : "";
             var paramStr = string.Join(", ", parameters.Select(p => $"{p.TypeName} {p.Name}"));
-            var signature = $"{string.Join(" ", modParts)} {returnType} {displayName}{genericStr}({paramStr})".Trim();
+            var signature = isCtor
+                ? $"{string.Join(" ", modParts)} {displayName}{genericStr}({paramStr})".Trim()
+                : $"{string.Join(" ", modParts)} {returnType} {displayName}{genericStr}({paramStr})".Trim();
 
             var detail = new MethodDetail(
                 Name: displayName,
@@ -312,7 +326,8 @@ public class ReflectionParser : ILanguageParser
                 Parameters: parameters,
                 GenericParameters: genericParams,
                 OverloadIndex: overloadIdx,
-                Summary: xml?.Summary
+                Summary: xml?.Summary,
+                ReturnTypeRef: returnTypeRef
             );
 
             if (isCtor) ctors.Add(detail);
@@ -323,7 +338,7 @@ public class ReflectionParser : ILanguageParser
 
     private static (List<FieldDetail> Fields, List<FieldDetail> EnumValues) ExtractFields(
         MetadataReader reader, TypeDefinition typeDef, string fullName,
-        Dictionary<string, XmlDocMember> xmlDocs, string kind)
+        Dictionary<string, XmlDocMember> xmlDocs, string kind, RichTypeDecoder richDecoder)
     {
         var fields = new List<FieldDetail>();
         var enumValues = new List<FieldDetail>();
@@ -338,13 +353,26 @@ public class ReflectionParser : ILanguageParser
 
             xmlDocs.TryGetValue($"F:{fullName}.{name}", out var xml);
 
+            TypeRef? fieldTypeRef = null;
+            string? fieldTypeName = null;
+            if (kind != "Enum")
+            {
+                try
+                {
+                    fieldTypeRef = field.DecodeSignature(richDecoder, null);
+                    fieldTypeName = fieldTypeRef.DisplayName;
+                }
+                catch { }
+            }
+
             var detail = new FieldDetail(
                 Name: name,
-                TypeName: null,
+                TypeName: fieldTypeName,
                 IsStatic: field.Attributes.HasFlag(FieldAttributes.Static),
                 IsReadOnly: field.Attributes.HasFlag(FieldAttributes.InitOnly),
                 IsConst: field.Attributes.HasFlag(FieldAttributes.Literal),
-                Summary: xml?.Summary
+                Summary: xml?.Summary,
+                TypeNameRef: fieldTypeRef
             );
 
             if (kind == "Enum") enumValues.Add(detail);
@@ -355,7 +383,7 @@ public class ReflectionParser : ILanguageParser
 
     private static List<EventDetail> ExtractEvents(
         MetadataReader reader, TypeDefinition typeDef, string fullName,
-        Dictionary<string, XmlDocMember> xmlDocs)
+        Dictionary<string, XmlDocMember> xmlDocs, RichTypeDecoder richDecoder)
     {
         var result = new List<EventDetail>();
         foreach (var handle in typeDef.GetEvents())
@@ -363,50 +391,118 @@ public class ReflectionParser : ILanguageParser
             var evt = reader.GetEventDefinition(handle);
             var name = reader.GetString(evt.Name);
             xmlDocs.TryGetValue($"E:{fullName}.{name}", out var xml);
-            result.Add(new EventDetail(Name: name, TypeName: null, Summary: xml?.Summary));
+
+            TypeRef? eventTypeRef = null;
+            string? eventTypeName = null;
+            if (!evt.Type.IsNil)
+            {
+                try
+                {
+                    if (evt.Type.Kind == HandleKind.TypeReference)
+                    {
+                        eventTypeRef = richDecoder.GetTypeFromReference(reader, (TypeReferenceHandle)evt.Type, 0);
+                        eventTypeName = eventTypeRef.DisplayName;
+                    }
+                    else if (evt.Type.Kind == HandleKind.TypeDefinition)
+                    {
+                        eventTypeRef = richDecoder.GetTypeFromDefinition(reader, (TypeDefinitionHandle)evt.Type, 0);
+                        eventTypeName = eventTypeRef.DisplayName;
+                    }
+                    else if (evt.Type.Kind == HandleKind.TypeSpecification)
+                    {
+                        eventTypeRef = richDecoder.GetTypeFromSpecification(reader, null, (TypeSpecificationHandle)evt.Type, 0);
+                        eventTypeName = eventTypeRef.DisplayName;
+                    }
+                }
+                catch { }
+            }
+
+            result.Add(new EventDetail(Name: name, TypeName: eventTypeName, Summary: xml?.Summary, TypeNameRef: eventTypeRef));
         }
         return result;
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    private static string DecodePropertyType(MetadataReader reader, PropertyDefinition prop)
-    {
-        try { return prop.DecodeSignature(new SimpleTypeDecoder(), null).ReturnType; }
-        catch { return "object"; }
-    }
-
-    private static (string ReturnType, List<ParameterDetail> Params) DecodeMethodSignature(
-        MetadataReader reader, MethodDefinition method, XmlDocMember? xml)
+    private static (string TypeName, TypeRef? TypeRef) DecodePropertyType(
+        MetadataReader reader, PropertyDefinition prop, RichTypeDecoder richDecoder)
     {
         try
         {
-            var sig = method.DecodeSignature(new SimpleTypeDecoder(), null);
+            var richSig = prop.DecodeSignature(richDecoder, null);
+            return (richSig.ReturnType.DisplayName, richSig.ReturnType);
+        }
+        catch { return ("object", null); }
+    }
+
+    private static (string ReturnType, List<ParameterDetail> Params, TypeRef? ReturnTypeRef, List<TypeRef?> ParamRefs) DecodeMethodSignature(
+        MetadataReader reader, MethodDefinition method, XmlDocMember? xml, RichTypeDecoder richDecoder)
+    {
+        try
+        {
+            var richSig = method.DecodeSignature(richDecoder, null);
             var paramHandles = method.GetParameters().ToList();
             var parameters = new List<ParameterDetail>();
+            var paramRefs = new List<TypeRef?>();
 
-            for (int i = 0; i < sig.ParameterTypes.Length; i++)
+            for (int i = 0; i < richSig.ParameterTypes.Length; i++)
             {
                 var paramName = i < paramHandles.Count
                     ? reader.GetString(reader.GetParameter(paramHandles[i]).Name)
                     : $"arg{i}";
-                if (xml is not null && xml.ParamDocs.TryGetValue(paramName, out var paramDoc))
-                {
-                    parameters.Add(new ParameterDetail(paramName, sig.ParameterTypes[i], false, null, paramDoc));
-                }
+
+                var typeRef = richSig.ParameterTypes[i];
+                string? paramDoc = null;
+                xml?.ParamDocs.TryGetValue(paramName, out paramDoc);
+
+                parameters.Add(new ParameterDetail(paramName, typeRef.DisplayName, false, null, paramDoc, TypeNameRef: typeRef));
+                paramRefs.Add(typeRef);
             }
-            return (sig.ReturnType, parameters);
+            return (richSig.ReturnType.DisplayName, parameters, richSig.ReturnType, paramRefs);
         }
-        catch { return ("void", []); }
+        catch { return ("void", [], null, []); }
     }
+
+    private static readonly HashSet<string> ImplicitBaseTypes = new(StringComparer.Ordinal)
+        { "Object", "ValueType", "Enum", "MulticastDelegate", "Delegate" };
 
     private static string? GetBaseTypeName(MetadataReader reader, TypeDefinition typeDef)
     {
-        if (typeDef.BaseType.IsNil || typeDef.BaseType.Kind != HandleKind.TypeReference) return null;
+        if (typeDef.BaseType.IsNil) return null;
         try
         {
-            var name = reader.GetString(reader.GetTypeReference((TypeReferenceHandle)typeDef.BaseType).Name);
-            return name is "Object" or "ValueType" or "Enum" or "MulticastDelegate" or "Delegate" ? null : name;
+            return typeDef.BaseType.Kind switch
+            {
+                HandleKind.TypeReference => FilterImplicitBase(
+                    reader.GetString(reader.GetTypeReference((TypeReferenceHandle)typeDef.BaseType).Name)),
+                HandleKind.TypeDefinition => FilterImplicitBase(
+                    reader.GetString(reader.GetTypeDefinition((TypeDefinitionHandle)typeDef.BaseType).Name)),
+                HandleKind.TypeSpecification => FilterImplicitBase(
+                    reader.GetTypeSpecification((TypeSpecificationHandle)typeDef.BaseType)
+                          .DecodeSignature(new SimpleTypeDecoder(), null)),
+                _ => null
+            };
+        }
+        catch { return null; }
+    }
+
+    private static string? FilterImplicitBase(string name)
+        => ImplicitBaseTypes.Contains(name) ? null : name;
+
+    private static TypeRef? GetBaseTypeRef(MetadataReader reader, TypeDefinition typeDef, RichTypeDecoder richDecoder)
+    {
+        if (typeDef.BaseType.IsNil) return null;
+        try
+        {
+            TypeRef? resolved = typeDef.BaseType.Kind switch
+            {
+                HandleKind.TypeReference => richDecoder.GetTypeFromReference(reader, (TypeReferenceHandle)typeDef.BaseType, 0),
+                HandleKind.TypeDefinition => richDecoder.GetTypeFromDefinition(reader, (TypeDefinitionHandle)typeDef.BaseType, 0),
+                HandleKind.TypeSpecification => richDecoder.GetTypeFromSpecification(reader, null, (TypeSpecificationHandle)typeDef.BaseType, 0),
+                _ => null
+            };
+            if (resolved is not null && ImplicitBaseTypes.Contains(resolved.DisplayName)) return null;
+            return resolved;
         }
         catch { return null; }
     }
@@ -419,12 +515,40 @@ public class ReflectionParser : ILanguageParser
             try
             {
                 var impl = reader.GetInterfaceImplementation(handle);
-                if (impl.Interface.Kind == HandleKind.TypeReference)
-                    names.Add(reader.GetString(reader.GetTypeReference((TypeReferenceHandle)impl.Interface).Name));
+                var name = impl.Interface.Kind switch
+                {
+                    HandleKind.TypeReference => reader.GetString(reader.GetTypeReference((TypeReferenceHandle)impl.Interface).Name),
+                    HandleKind.TypeDefinition => reader.GetString(reader.GetTypeDefinition((TypeDefinitionHandle)impl.Interface).Name),
+                    HandleKind.TypeSpecification => reader.GetTypeSpecification((TypeSpecificationHandle)impl.Interface)
+                                                         .DecodeSignature(new SimpleTypeDecoder(), null),
+                    _ => null
+                };
+                if (name is not null) names.Add(name);
             }
             catch { }
         }
         return [.. names];
+    }
+
+    private static TypeRef[] GetInterfaceRefs(MetadataReader reader, TypeDefinition typeDef, RichTypeDecoder richDecoder)
+    {
+        var refs = new List<TypeRef>();
+        foreach (var handle in typeDef.GetInterfaceImplementations())
+        {
+            try
+            {
+                var impl = reader.GetInterfaceImplementation(handle);
+                TypeRef? resolved = impl.Interface.Kind switch
+                {
+                    HandleKind.TypeReference => richDecoder.GetTypeFromReference(reader, (TypeReferenceHandle)impl.Interface, 0),
+                    HandleKind.TypeSpecification => richDecoder.GetTypeFromSpecification(reader, null, (TypeSpecificationHandle)impl.Interface, 0),
+                    _ => null
+                };
+                if (resolved is not null) refs.Add(resolved);
+            }
+            catch { }
+        }
+        return [.. refs];
     }
 
     private static string[] GetGenericParams<T>(MetadataReader reader, GenericParameterHandleCollection handles)

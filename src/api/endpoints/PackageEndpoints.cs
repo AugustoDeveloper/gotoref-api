@@ -66,7 +66,7 @@ public static class PackageEndpoints
                 {
                     var nupkgPath = await registry.DownloadPackageAsync(id, version, ct);
                     var metadata  = await registry.GetMetadataAsync(id, version, ct);
-                    var namespaces = await parser.ExtractTypesAsync(nupkgPath, ct);
+                    var namespaces = await parser.ExtractTypesAsync(nupkgPath, id, ct);
                     var hasSource = parser.HasEmbeddedSource(nupkgPath);
 
                     return new PackageDetail(
@@ -121,7 +121,7 @@ public static class PackageEndpoints
                 {
                     var nupkgPath = await registry.DownloadPackageAsync(id, version, ct);
                     var metadata  = await registry.GetMetadataAsync(id, version, ct);
-                    var namespaces = await parser.ExtractTypesAsync(nupkgPath, ct);
+                    var namespaces = await parser.ExtractTypesAsync(nupkgPath, id, ct);
                     var hasSource = parser.HasEmbeddedSource(nupkgPath);
 
                     return new PackageDetail(

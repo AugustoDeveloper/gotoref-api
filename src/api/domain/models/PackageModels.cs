@@ -71,7 +71,9 @@ public record TypeDetail(
     List<MethodDetail> Constructors,
     List<FieldDetail> Fields,
     List<FieldDetail> EnumValues,
-    List<EventDetail> Events
+    List<EventDetail> Events,
+    TypeRef? BaseTypeRef = null,
+    TypeRef[]? InterfacesRef = null
 );
 
 public record PropertyDetail(
@@ -81,7 +83,8 @@ public record PropertyDetail(
     bool HasSetter,
     string Accessors,        // "get;" | "get; set;" | "get; init;"
     bool IsStatic,
-    string? Summary
+    string? Summary,
+    TypeRef? TypeNameRef = null
 );
 
 public record MethodDetail(
@@ -96,7 +99,8 @@ public record MethodDetail(
     List<ParameterDetail> Parameters,
     string[] GenericParameters,
     int OverloadIndex,
-    string? Summary
+    string? Summary,
+    TypeRef? ReturnTypeRef = null
 );
 
 public record ParameterDetail(
@@ -104,7 +108,8 @@ public record ParameterDetail(
     string TypeName,
     bool IsOptional,
     string? DefaultValue,
-    string? XmlDoc
+    string? XmlDoc,
+    TypeRef? TypeNameRef = null
 );
 
 public record FieldDetail(
@@ -113,11 +118,21 @@ public record FieldDetail(
     bool IsStatic,
     bool IsReadOnly,
     bool IsConst,
-    string? Summary
+    string? Summary,
+    TypeRef? TypeNameRef = null
 );
 
 public record EventDetail(
     string Name,
     string? TypeName,
-    string? Summary
+    string? Summary,
+    TypeRef? TypeNameRef = null
+);
+
+public record TypeRef(
+    string DisplayName,
+    string? PackageId,
+    string? PackageVersion,
+    bool IsCurrentPackage,
+    TypeRef[]? TypeArguments = null
 );
